@@ -543,6 +543,19 @@ local function popMessage(self, messageQueue, processQueue)
     end
 end
 
+local max_sleep_interval = 1
+local function sleep(sec)
+    if sec <= max_sleep_interval then
+        return ngx.sleep(sec)
+    end
+    ngx.sleep(max_sleep_interval)
+    if ngx.worker.exiting() then
+        return
+    end
+    sec = sec - max_sleep_interval
+    return sleep(sec)
+end
+
 function _M:start()
     local self = self
     if not self.messageListener then
@@ -553,24 +566,38 @@ function _M:start()
     copySubscription(self)
     initRebalanceImpl(self)
     updateTopicSubscribeInfoWhenSubscriptionChanged(self)
+
     ngx_timer_at(0, function()
         local sock_map = {}
         while self.running do
+            if ngx.worker.exiting() then
+                self:stop()
+                break
+            end
             self.client:updateAllTopicRouteInfoFromNameserver()
             sendHeartbeatToAllBroker(self, sock_map)
-            ngx.sleep(30)
+            sleep(30)
         end
     end)
-    ngx.timer.every(5, function()
+
+    local function processQueueTable(premature)
+        if premature or not self.running or ngx.worker.exiting() then
+            return
+        end
+
         for mqKey, _ in pairs(self.rebalancer.processQueueTable) do
             local mq = utils.buildMq(mqKey)
             self.offsetStore:persist(mq)
         end
-    end)
+
+        ngx.timer.at(5, processQueueTable)
+    end
+
+    ngx.timer.at(5, processQueueTable)
+
     if self.traceDispatcher then
         self.traceDispatcher:start()
     end
-
 end
 
 function _M:stop()
